@@ -15,8 +15,7 @@ byteorder = "1.2"
 bytes = "0.5"
 lazy_static = "1.0"
 log = "0.4"
-mio = "0.6"
-mio-extras = "2"
+mio = { version = "1.0.4", features = ["net", "os-poll"] }
 snowflake = "1.0.0"
 zookeeper_derive = { path = "zookeeper-derive", version = "0.4.1" }
 

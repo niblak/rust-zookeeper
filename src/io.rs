@@ -9,15 +9,15 @@ use zookeeper::{RawRequest, RawResponse};
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{Buf, Bytes, BytesMut};
 use mio::net::TcpStream;
-use mio::*;
-use mio_extras::channel::{channel, Receiver, Sender};
-use mio_extras::timer::{Timeout, Timer};
-use std::collections::VecDeque;
+use mio::{Events, Interest, Poll, Token, Waker};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, VecDeque};
 use std::io;
 use std::io::{Cursor, ErrorKind};
 use std::mem;
 use std::net::SocketAddr;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const ZK: Token = Token(1);
@@ -35,14 +35,151 @@ lazy_static! {
     .unwrap();
 }
 
+// Custom timer implementation to replace mio-extras timer
+#[derive(Debug, Clone)]
+struct TimeoutEntry<T> {
+    deadline: Instant,
+    id: usize,
+    data: T,
+}
+
+impl<T> PartialEq for TimeoutEntry<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.id == other.id
+    }
+}
+
+impl<T> Eq for TimeoutEntry<T> {}
+
+impl<T> PartialOrd for TimeoutEntry<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Ord for TimeoutEntry<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse ordering for min-heap (earliest deadline first)
+        other
+            .deadline
+            .cmp(&self.deadline)
+            .then_with(|| other.id.cmp(&self.id))
+    }
+}
+
+#[derive(Debug)]
+struct SimpleTimeout {
+    id: usize,
+}
+
+#[derive(Debug)]
+struct SimpleTimer<T> {
+    heap: BinaryHeap<TimeoutEntry<T>>,
+    next_id: usize,
+}
+
+impl<T> SimpleTimer<T> {
+    fn new() -> Self {
+        SimpleTimer {
+            heap: BinaryHeap::new(),
+            next_id: 0,
+        }
+    }
+
+    fn set_timeout(&mut self, duration: Duration, data: T) -> SimpleTimeout {
+        let deadline = Instant::now() + duration;
+        let id = self.next_id;
+        self.next_id += 1;
+
+        self.heap.push(TimeoutEntry { deadline, id, data });
+
+        SimpleTimeout { id }
+    }
+
+    fn cancel_timeout(&mut self, timeout: &SimpleTimeout) {
+        // Mark as cancelled by removing from heap
+        // Note: This is a simplified implementation. In practice, we'd want to mark
+        // entries as cancelled rather than rebuilding the heap, but for this use case
+        // it's sufficient since timeouts are infrequent.
+        self.heap.retain(|entry| entry.id != timeout.id);
+    }
+
+    fn poll(&mut self) -> Option<T> {
+        let now = Instant::now();
+        while let Some(entry) = self.heap.peek() {
+            if entry.deadline <= now {
+                let entry = self.heap.pop().unwrap();
+                return Some(entry.data);
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
+    fn next_timeout(&self) -> Option<Duration> {
+        self.heap.peek().map(|entry| {
+            let now = Instant::now();
+            if entry.deadline > now {
+                entry.deadline - now
+            } else {
+                Duration::from_millis(0)
+            }
+        })
+    }
+}
+
+// Custom channel implementation to replace mio-extras channel
+struct MioChannel<T> {
+    sender: Sender<T>,
+    receiver: Receiver<T>,
+    waker: Arc<Waker>,
+}
+
+fn mio_channel<T>(poll: &Poll) -> io::Result<MioChannel<T>> {
+    let (sender, receiver) = mpsc::channel();
+    let waker = Arc::new(Waker::new(poll.registry(), CHANNEL)?);
+
+    Ok(MioChannel {
+        sender,
+        receiver,
+        waker,
+    })
+}
+
+impl<T> MioChannel<T> {
+    fn sender(&self) -> MioChannelSender<T> {
+        MioChannelSender {
+            sender: self.sender.clone(),
+            waker: Arc::clone(&self.waker),
+        }
+    }
+
+    fn try_recv(&self) -> Result<T, TryRecvError> {
+        self.receiver.try_recv()
+    }
+}
+
+#[derive(Clone)]
+pub struct MioChannelSender<T> {
+    sender: Sender<T>,
+    waker: Arc<Waker>,
+}
+
+impl<T> MioChannelSender<T> {
+    pub fn send(&self, msg: T) -> Result<(), mpsc::SendError<T>> {
+        let result = self.sender.send(msg);
+        if result.is_ok() {
+            // Wake up the event loop
+            let _ = self.waker.wake();
+        }
+        result
+    }
+}
+
 struct Hosts {
     addrs: Vec<SocketAddr>,
     index: usize,
-}
-
-#[inline]
-fn pollopt() -> PollOpt {
-    PollOpt::edge() | PollOpt::oneshot()
 }
 
 impl Hosts {
@@ -77,9 +214,9 @@ pub struct ZkIo {
     buffer: VecDeque<RawRequest>,
     inflight: VecDeque<RawRequest>,
     response: BytesMut,
-    ping_timeout: Option<Timeout>,
-    conn_timeout: Option<Timeout>,
-    timer: Timer<ZkTimeout>,
+    ping_timeout: Option<SimpleTimeout>,
+    conn_timeout: Option<SimpleTimeout>,
+    timer: SimpleTimer<ZkTimeout>,
     timeout_ms: u64,
     ping_timeout_duration: Duration,
     conn_timeout_duration: Duration,
@@ -90,8 +227,8 @@ pub struct ZkIo {
     state_listeners: ListenerSet<ZkState>,
     poll: Poll,
     shutdown: bool,
-    tx: Sender<RawRequest>,
-    rx: Receiver<RawRequest>,
+    tx: MioChannelSender<RawRequest>,
+    rx: MioChannel<RawRequest>,
 }
 
 impl ZkIo {
@@ -104,10 +241,18 @@ impl ZkIo {
         trace!("ZkIo::new");
         let timeout_ms = ping_timeout_duration.as_secs() * 1000
             + ping_timeout_duration.subsec_nanos() as u64 / 1000000;
-        let (tx, rx) = channel();
+
+        // TODO I need a socket here, sorry.
+        let sock = TcpStream::connect(addrs[0]).unwrap();
+
+        // TODO add error handling to this method in subsequent commit.
+        // There's already another unwrap which needs to be addressed.
+        let poll = Poll::new().unwrap();
+        let channel = mio_channel(&poll).unwrap();
+        let tx = channel.sender();
 
         let mut zkio = ZkIo {
-            sock: TcpStream::connect(&addrs[0]).unwrap(), // TODO I need a socket here, sorry.
+            sock,
             state: ZkState::Connecting,
             hosts: Hosts::new(addrs),
             buffer: VecDeque::new(),
@@ -125,13 +270,11 @@ impl ZkIo {
             zxid: 0,
             ping_sent: Instant::now(),
             state_listeners: state_listeners,
-            // TODO add error handling to this method in subsequent commit.
-            // There's already another unwrap which needs to be addressed.
-            poll: Poll::new().unwrap(),
+            poll,
             shutdown: false,
-            timer: Timer::default(),
-            tx: tx,
-            rx: rx,
+            timer: SimpleTimer::new(),
+            tx,
+            rx: channel,
         };
 
         let request = zkio.connect_request();
@@ -139,9 +282,10 @@ impl ZkIo {
         zkio
     }
 
-    fn reregister(&mut self, interest: Ready) {
+    fn reregister(&mut self, interest: Interest) {
         self.poll
-            .reregister(&self.sock, ZK, interest, pollopt())
+            .registry()
+            .reregister(&mut self.sock, ZK, interest)
             .expect("Failed to register ZK handle");
     }
 
@@ -273,7 +417,7 @@ impl ZkIo {
                 .send(WatchMessage::RemoveWatch(w.path, w.watcher_type))
                 .unwrap(),
             (_, Some(w)) => self.watch_sender.send(WatchMessage::Watch(w)).unwrap(),
-            (_, None) => {},
+            (_, None) => {}
         }
     }
 
@@ -301,9 +445,7 @@ impl ZkIo {
                 self.conn_timeout = Some(self.timer.set_timeout(duration, atype));
             }
         }
-        self.poll
-            .reregister(&self.timer, TIMER, Ready::readable(), pollopt())
-            .expect("Reregister TIMER");
+        // No need to reregister timer in mio 1.0 - we'll handle timeouts in poll loop
     }
 
     fn reconnect(&mut self) {
@@ -334,7 +476,7 @@ impl ZkIo {
             {
                 let host = self.hosts.get();
                 info!("Connecting to new server {:?}", host);
-                self.sock = match TcpStream::connect(host) {
+                self.sock = match TcpStream::connect(*host) {
                     Ok(sock) => sock,
                     Err(e) => {
                         error!("Failed to connect {:?}: {:?}", host, e);
@@ -349,9 +491,9 @@ impl ZkIo {
             self.buffer.push_back(request);
 
             // Register the new socket
-            let pollopt = PollOpt::edge() | PollOpt::oneshot();
             self.poll
-                .register(&self.sock, ZK, Ready::all(), pollopt)
+                .registry()
+                .register(&mut self.sock, ZK, Interest::READABLE | Interest::WRITABLE)
                 .expect("Register ZK");
 
             break;
@@ -369,21 +511,26 @@ impl ZkIo {
         }
     }
 
-    fn ready(&mut self, token: Token, ready: Ready) {
-        trace!("event token={:?} ready={:?}", token, ready);
+    fn ready(&mut self, token: Token, event: &mio::event::Event) {
+        trace!(
+            "event token={:?} readable={} writable={}",
+            token,
+            event.is_readable(),
+            event.is_writable()
+        );
 
         match token {
-            ZK => self.ready_zk(ready),
-            TIMER => self.ready_timer(ready),
-            CHANNEL => self.ready_channel(ready),
+            ZK => self.ready_zk(event),
+            TIMER => self.ready_timer(),
+            CHANNEL => self.ready_channel(),
             _ => unreachable!(),
         }
     }
 
-    fn ready_zk(&mut self, ready: Ready) {
+    fn ready_zk(&mut self, event: &mio::event::Event) {
         self.clear_timeout(ZkTimeout::Ping);
 
-        if ready.is_writable() {
+        if event.is_writable() {
             while let Some(mut request) = self.buffer.pop_front() {
                 match self.sock.try_write_buf(&mut request.data) {
                     Ok(Some(0)) => {
@@ -415,7 +562,7 @@ impl ZkIo {
             }
         }
 
-        if ready.is_readable() {
+        if event.is_readable() {
             match self.sock.try_read_buf(&mut self.response) {
                 Ok(Some(0)) => {
                     warn!("Connection closed: read");
@@ -440,7 +587,7 @@ impl ZkIo {
             }
         }
 
-        if (ready.is_hup()) && (self.state != ZkState::Closed) {
+        if event.is_error() && (self.state != ZkState::Closed) {
             // If we were connected
             // fn send_watched_event(keeper_state: KeeperState) {
             //     match sender.send(WatchedEvent{event_type: WatchedEventType::None,
@@ -464,9 +611,9 @@ impl ZkIo {
 
         // Not sure that we need to write, but we always need to read, because of watches
         // If the output buffer has no content, we don't need to write again
-        let mut interest = Ready::all();
+        let mut interest = Interest::READABLE | Interest::WRITABLE;
         if self.buffer.is_empty() {
-            interest.remove(Ready::writable());
+            interest = Interest::READABLE;
         }
 
         // This tick is done, subscribe to a forthcoming one
@@ -477,7 +624,7 @@ impl ZkIo {
         self.inflight.is_empty() && self.buffer.is_empty()
     }
 
-    fn ready_channel(&mut self, _: Ready) {
+    fn ready_channel(&mut self) {
         while let Ok(request) = self.rx.try_recv() {
             trace!("ready_channel {:?}", request.opcode);
 
@@ -498,19 +645,16 @@ impl ZkIo {
                 _ => {
                     // Otherwise, queue request for processing.
                     if self.buffer.is_empty() {
-                        self.reregister(Ready::all());
+                        self.reregister(Interest::READABLE | Interest::WRITABLE);
                     }
                     self.buffer.push_back(request);
                 }
             }
         }
-
-        self.poll
-            .reregister(&self.rx, CHANNEL, Ready::readable(), pollopt())
-            .expect("Reregister CHANNEL");
+        // No need to reregister channel in mio 1.0 - waker handles notifications
     }
 
-    fn ready_timer(&mut self, _: Ready) {
+    fn ready_timer(&mut self) {
         trace!("ready_timer thread={:?}", ::std::thread::current().id());
 
         loop {
@@ -541,35 +685,28 @@ impl ZkIo {
                     }
                 }
                 None => {
-                    if self.ping_timeout.is_some() || self.conn_timeout.is_some() {
-                        trace!("Spurious timer");
-                        self.poll
-                            .reregister(&self.timer, TIMER, Ready::readable(), pollopt())
-                            .expect("Reregister TIMER");
-                    }
                     break;
                 }
             }
         }
     }
 
-    pub fn sender(&self) -> Sender<RawRequest> {
-        self.tx.clone()
+    pub fn sender(&self) -> MioChannelSender<RawRequest> {
+        MioChannelSender {
+            sender: self.tx.sender.clone(),
+            waker: Arc::clone(&self.tx.waker),
+        }
     }
 
     pub fn run(mut self) -> io::Result<()> {
         let mut events = Events::with_capacity(128);
 
         // Register Initial Interest
-        self.poll
-            .register(&self.sock, ZK, Ready::all(), pollopt())
-            .expect("Register ZK");
-        self.poll
-            .register(&self.timer, TIMER, Ready::readable(), pollopt())
-            .expect("Register TIMER");
-        self.poll
-            .register(&self.rx, CHANNEL, Ready::readable(), pollopt())
-            .expect("Register CHANNEL");
+        self.poll.registry().register(
+            &mut self.sock,
+            ZK,
+            Interest::READABLE | Interest::WRITABLE,
+        )?;
 
         loop {
             // Handle loop shutdown
@@ -577,12 +714,23 @@ impl ZkIo {
                 break;
             }
 
-            // Wait for events
-            self.poll.poll(&mut events, None)?;
+            // Calculate timeout for next timer event
+            let timeout = self.timer.next_timeout();
 
-            // Process events
+            // Wait for events
+            self.poll.poll(&mut events, timeout)?;
+
+            // Handle timer events first
+            self.ready_timer();
+
+            // Handle channel events
+            self.ready_channel();
+
+            // Process socket events
             for event in &events {
-                self.ready(event.token(), event.readiness());
+                if event.token() == ZK {
+                    self.ready(event.token(), event);
+                }
             }
         }
 
