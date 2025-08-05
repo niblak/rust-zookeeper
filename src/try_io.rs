@@ -75,6 +75,7 @@ impl<T: Write> TryWrite for T {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) trait TryAccept {
     type Output;
 

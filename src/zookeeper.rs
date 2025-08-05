@@ -509,7 +509,7 @@ impl ZooKeeper {
             watcher: Box::new(watcher),
         };
 
-        try!(self.request(OpCode::AddWatch, self.xid(), req, Some(watch)));
+        try!(self.request::<_, ()>(OpCode::AddWatch, self.xid(), req, Some(watch)));
         Ok(())
     }
 
@@ -527,7 +527,7 @@ impl ZooKeeper {
             watcher: Box::new(|_| {}),
         };
 
-        try!(self.request(OpCode::RemoveWatches, self.xid(), req, Some(watch)));
+        try!(self.request::<_, ()>(OpCode::RemoveWatches, self.xid(), req, Some(watch)));
         Ok(())
     }
 

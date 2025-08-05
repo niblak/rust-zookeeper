@@ -36,6 +36,7 @@ enum RefreshMode {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum Operation {
     Initialize,
     Shutdown,
